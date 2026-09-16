@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>磨削接刀标定计算器‑多设备版【动态拟合阶数+物理约束】</title>
+<title>磨削接刀标定计算器‑多设备版【多项式+动态阶数拉格朗日插值】</title>
 <style>
 *{box-sizing:border-box;font-family:system-ui}
 body{max-width:1100px;margin:16px auto;padding:12px;background:#f4f6f8}
@@ -20,7 +20,6 @@ th,td{border:1px solid #ccc;padding:6px;text-align:center}
 th{background:#efefef}
 .warn{color:#c00;font-weight:bold}
 .info{color:#066;font-weight:bold}
-/* 修复底部多余按钮：页面不出现多余滚动按钮，移动端适配 */
 html,body{height:100%;margin:0;padding:0}
 </style>
 </head>
@@ -50,9 +49,13 @@ html,body{height:100%;margin:0;padding:0}
 <h3>🔢 计算区</h3>
 <div class="row">
     <select id="fitOrderSelect">
-        <!-- 阶数下拉由JS动态生成，不再写死1‑4 -->
     </select>
-    <span>拟合阶数选择（磨削接刀建议1‑2阶，高阶易出现物理震荡）</span>
+    <span>多项式拟合阶数（磨削接刀建议1‑2阶，高阶易出现物理震荡）</span>
+</div>
+<div class="row">
+    <select id="lagOrderSelect">
+    </select>
+    <span>拉格朗日插值阶数（推荐4阶；测点数量必须大于插值阶数）</span>
 </div>
 <div class="row">
     <input id="evalX" placeholder="输入X求Y，例 -0.186">
@@ -71,31 +74,29 @@ html,body{height:100%;margin:0;padding:0}
 </div>
 
 <div class="box">
-<h3>📋 调机参考表（四次拉格朗日插值，独立于多项式拟合）</h3>
+<h3>📋 调机参考表（拉格朗日插值，独立于多项式拟合）</h3>
 <div class="row">
-    <input id="refXStart" value="-0.21" placeholder="起始X">
-    <input id="refXEnd" value="-0.17" placeholder="结束X">
-    <input id="refStep" value="0.002" placeholder="步长mm">
+    <input id="refXStart" value="-0.35" placeholder="插值起始X">
+    <input id="refXEnd" value="0.00" placeholder="插值结束X">
+    <input id="refStep" value="0.002" placeholder="步长 mm">
     <button onclick="buildRefTable()">生成参考表</button>
 </div>
 <div id="refTable"></div>
 </div>
 
 <script>
-// localStorage存储key
 const STORAGE_KEY = "grind_calib_devices";
 let deviceList = [];
 let activeDeviceId = null;
 let currentFitCoef = null;
 let currentFitOrder = 1;
+let currentLagOrder = 4;
 
-// 读取本地存储
 function loadStorage(){
     let raw = localStorage.getItem(STORAGE_KEY);
     if(raw){
         deviceList = JSON.parse(raw);
     }else{
-        // 默认初始化一台设备
         deviceList = [
             {
                 id:"dev_001",
@@ -117,7 +118,6 @@ function saveStorage(){
     localStorage.setItem(STORAGE_KEY, JSON.stringify(deviceList));
 }
 
-// 刷新设备下拉选择框
 function renderDeviceSelect(){
     const sel = document.getElementById("deviceSelect");
     sel.innerHTML = "";
@@ -133,14 +133,13 @@ function renderDeviceSelect(){
     sel.onchange = function(){
         activeDeviceId = this.value;
         renderTable();
-        refreshFitOrderSelect(); //【修改】测点变化，刷新阶数下拉
+        refreshFitOrderSelect();
+        refreshLagOrderSelect();
         try{doFit();}catch(e){console.error(e);}
     }
 }
 
-/**
- * 【核心修改】动态生成拟合阶数下拉：最大阶数=测点数量‑1
- */
+//刷新多项式拟合阶数下拉
 function refreshFitOrderSelect(){
     const sel = document.getElementById("fitOrderSelect");
     sel.innerHTML = "";
@@ -155,7 +154,6 @@ function refreshFitOrderSelect(){
         sel.appendChild(opt);
         return;
     }
-    // 生成1~maxOrder所有可选阶数
     for(let m=1;m<=maxOrder;m++){
         const opt = document.createElement("option");
         opt.value = m;
@@ -163,18 +161,42 @@ function refreshFitOrderSelect(){
         opt.innerText = desc;
         sel.appendChild(opt);
     }
-    // 优先选中2阶；如果只有1阶就选1阶
     const defaultSel = Math.min(2,maxOrder);
     sel.value = defaultSel;
     currentFitOrder = defaultSel;
 }
 
-// 获取当前激活设备对象
+//刷新拉格朗日插值阶数下拉，推荐默认4阶，测点不够自动降
+function refreshLagOrderSelect(){
+    const sel = document.getElementById("lagOrderSelect");
+    sel.innerHTML = "";
+    const dev = getActiveDevice();
+    if(!dev) return;
+    const nPoint = dev.points.length;
+    const maxLag = nPoint - 1;
+    if(maxLag <1){
+        const opt = document.createElement("option");
+        opt.value = 0;
+        opt.innerText = "测点不足，无法插值";
+        sel.appendChild(opt);
+        return;
+    }
+    for(let m=1;m<=maxLag;m++){
+        const opt = document.createElement("option");
+        opt.value = m;
+        let desc = `${m}阶（${m===1?"线性":m===2?"二次":m===3?"三次":m===4?"四次":m+"次"}）`;
+        opt.innerText = desc;
+        sel.appendChild(opt);
+    }
+    //默认选中4阶，如果最大阶数小于4，则选最大阶
+    currentLagOrder = Math.min(4, maxLag);
+    sel.value = currentLagOrder;
+}
+
 function getActiveDevice(){
     return deviceList.find(d=>d.id === activeDeviceId);
 }
 
-// 新建设备弹窗输入名字
 function createNewDevice(){
     let devName = prompt("输入设备名称：例如：磨床A，主轴2号");
     if(!devName || devName.trim()==="") return;
@@ -189,17 +211,16 @@ function createNewDevice(){
     renderDeviceSelect();
     renderTable();
     refreshFitOrderSelect();
+    refreshLagOrderSelect();
     try{doFit();}catch(e){console.error(e);}
 }
 
-// 删除当前选中设备
 function deleteCurrentDevice(){
     let dev = getActiveDevice();
     if(!dev) return;
     if(!confirm(`确认删除设备【${dev.name}】，所有测点数据会丢失！`)) return;
     deviceList = deviceList.filter(d=>d.id!==activeDeviceId);
     if(deviceList.length===0){
-        // 至少保留一个空设备
         deviceList.push({id:"dev_"+Date.now(),name:"新设备",points:[]});
     }
     activeDeviceId = deviceList[0].id;
@@ -207,10 +228,10 @@ function deleteCurrentDevice(){
     renderDeviceSelect();
     renderTable();
     refreshFitOrderSelect();
+    refreshLagOrderSelect();
     try{doFit();}catch(e){console.error(e);}
 }
 
-// 导出当前设备CSV文本，浏览器下载
 function exportDeviceCSV(){
     let dev = getActiveDevice();
     if(!dev || dev.points.length===0){alert("当前设备没有测点");return;}
@@ -238,7 +259,8 @@ function addPoint(){
     document.getElementById('inY').value='';
     saveStorage();
     renderTable();
-    refreshFitOrderSelect(); //【修改】新增测点，刷新阶数下拉
+    refreshFitOrderSelect();
+    refreshLagOrderSelect();
     try{doFit();}catch(err){console.error(err);}
 }
 
@@ -248,7 +270,8 @@ function delPoint(idx){
     dev.points.splice(idx,1);
     saveStorage();
     renderTable();
-    refreshFitOrderSelect(); //【修改】删除测点，刷新阶数下拉
+    refreshFitOrderSelect();
+    refreshLagOrderSelect();
     try{doFit();}catch(err){console.error(err);}
 }
 
@@ -260,6 +283,7 @@ function clearAllPoints(){
     saveStorage();
     renderTable();
     refreshFitOrderSelect();
+    refreshLagOrderSelect();
     try{doFit();}catch(err){console.error(err);}
 }
 
@@ -276,7 +300,6 @@ function renderTable(){
     })
 }
 
-//修复版高斯消元
 function gauss(A, B){
     let n = B.length;
     for(let i=0;i<n;i++){
@@ -319,17 +342,22 @@ function polyFit(pList, m){
     return gauss(A,B);
 }
 
-//拉格朗日插值求值
-function lagrangeEval(pList, x0){
-    let n=pList.length;
+//拉格朗日插值，取前lagOrder+1个点做插值
+function lagrangeEval(pList, x0, lagOrder){
+    const n = pList.length;
+    const useN = lagOrder + 1;
+    if(useN > n) return NaN;
+    //取测点，按距离x0最近的useN个点
+    const sorted = [...pList].sort((a,b)=>Math.abs(a.x-x0)-Math.abs(b.x-x0));
+    const subPoints = sorted.slice(0, useN);
     let res=0;
-    for(let i=0;i<n;i++){
+    for(let i=0;i<subPoints.length;i++){
         let li=1.0;
-        for(let j=0;j<n;j++){
+        for(let j=0;j<subPoints.length;j++){
             if(i===j) continue;
-            li *= (x0 - pList[j].x)/(pList[i].x - pList[j].x);
+            li *= (x0 - subPoints[j].x)/(subPoints[i].x - subPoints[j].x);
         }
-        res += pList[i].y * li;
+        res += subPoints[i].y * li;
     }
     return res;
 }
@@ -343,29 +371,17 @@ function polyEval(coef, x){
     return y;
 }
 
-/**
- * 物理校验：多项式在测点区间内是否单调
- * 磨削接刀误差物理特征：X变化，Y应该单调变化，不应该来回震荡
- * @param {Array} coef 多项式系数
- * @param {number} xMin 测点最小X
- * @param {number} xMax 测点最大X
- * @returns {boolean} true=单调；false=出现震荡（违背物理）
- */
 function checkPolyMonotonic(coef, xMin, xMax){
-    if(!coef || coef.length<=2) return true; //1阶线性天然单调
-    // 取区间内若干采样点，判断导数符号是否发生反转
+    if(!coef || coef.length<=2) return true;
     const sampleNum = 50;
     let prevDeriv = null;
     for(let s=0;s<=sampleNum;s++){
         let x = xMin + (xMax-xMin)*s/sampleNum;
-        // 多项式导数：y = a0+a1*x+a2*x²+a3*x³+a4*x⁴
-        // y' = a1 + 2*a2*x +3*a3*x² +4*a4*x³
         let dy = 0;
         for(let i=1;i<coef.length;i++){
             dy += i * coef[i] * Math.pow(x, i-1);
         }
         if(prevDeriv !== null){
-            // 导数符号发生反转，代表曲线出现拐点震荡
             if((dy>1e-9 && prevDeriv<-1e-9) || (dy<-1e-9 && prevDeriv>1e-9)){
                 return false;
             }
@@ -375,30 +391,29 @@ function checkPolyMonotonic(coef, xMin, xMax){
     return true;
 }
 
-//二分法求根
-function findRoot(coefOrPointList, xL, xR, isLagrange){
-    let fL = isLagrange ? lagrangeEval(coefOrPointList,xL) : polyEval(coefOrPointList,xL);
-    let fR = isLagrange ? lagrangeEval(coefOrPointList,xR) : polyEval(coefOrPointList,xR);
+function findRoot(coefOrPointList, xL, xR, isLagrange, lagOrder){
+    let fL = isLagrange ? lagrangeEval(coefOrPointList,xL,lagOrder) : polyEval(coefOrPointList,xL);
+    let fR = isLagrange ? lagrangeEval(coefOrPointList,xR,lagOrder) : polyEval(coefOrPointList,xR);
     if((fL>0&&fR>0) || (fL<0&&fR<0)) return null;
     for(let k=0;k<80;k++){
         let xm=(xL+xR)/2;
-        let fm = isLagrange ? lagrangeEval(coefOrPointList,xm) : polyEval(coefOrPointList,xm);
+        let fm = isLagrange ? lagrangeEval(coefOrPointList,xm,lagOrder) : polyEval(coefOrPointList,xm);
         if(Math.abs(fm)<1e-7) return xm;
-        let fLm = isLagrange ? lagrangeEval(coefOrPointList,xL) : polyEval(coefOrPointList,xL);
+        let fLm = isLagrange ? lagrangeEval(coefOrPointList,xL,lagOrder) : polyEval(coefOrPointList,xL);
         if((fm>0&&fLm>0)||(fm<0&&fLm<0)) xL=xm;
         else xR=xm;
     }
     return (xL+xR)/2;
 }
 
-//生成自定义区间调机参考表
 function buildRefTable(){
     const refDiv = document.getElementById('refTable');
     let dev = getActiveDevice();
     if(!dev) return;
     const points = dev.points;
-    if(points.length<5){
-        refDiv.innerHTML="<span class='warn'>需要至少5个测点才能生成四次插值参考表</span>";
+    const needPoint = currentLagOrder + 1;
+    if(points.length < needPoint){
+        refDiv.innerHTML=`<span class='warn'>需要至少${needPoint}个测点才能生成${currentLagOrder}阶插值参考表</span>`;
         return;
     }
     let xStart = parseFloat(document.getElementById("refXStart").value);
@@ -408,23 +423,29 @@ function buildRefTable(){
         refDiv.innerHTML="<span class='warn'>请输入合法的起始、结束X与正步长</span>";
         return;
     }
+    // 自动交换起止，保证start < end
     if(xStart>xEnd){
         [xStart,xEnd] = [xEnd,xStart];
     }
-    let rHtml='<table><tr><th>X(mm)</th><th>四次插值Y(mm)</th></tr>';
+    const xs = points.map(p=>p.x);
+    const ptMinX = Math.min(...xs);
+    const ptMaxX = Math.max(...xs);
+
+    let rHtml='<table><tr><th>X(mm)</th><th>'+currentLagOrder+'阶插值Y(mm)</th></tr>';
     for(let xv=xStart; xv<=xEnd+1e-9; xv+=step){
-        let y4 = lagrangeEval(points, xv);
-        rHtml += `<tr><td>${xv.toFixed(3)}</td><td>${y4.toFixed(6)}</td></tr>`;
+        let yVal = lagrangeEval(points, xv, currentLagOrder);
+        let outOfRange = (xv < ptMinX - 1e-9) || (xv > ptMaxX + 1e-9);
+        if(outOfRange){
+            rHtml += `<tr><td>${xv.toFixed(3)}</td><td style="color:#c00">外推不可信</td></tr>`;
+        }else{
+            rHtml += `<tr><td>${xv.toFixed(3)}</td><td>${yVal.toFixed(6)}</td></tr>`;
+        }
     }
     rHtml+='</table>';
+    rHtml += `<div class="warn">⚠️测点有效区间 X ∈ [${ptMinX.toFixed(4)},${ptMaxX.toFixed(4)}]；区间外为外推，结果不可信</div>`;
     refDiv.innerHTML=rHtml;
 }
 
-/**
- * 构造多项式表达式字符串，用于页面显示
- * @param {Array} coef 系数数组 [a0,a1,a2,a3,a4]
- * @returns {string} 可读公式
- */
 function formatPolyFormula(coef){
     let parts = [];
     for(let i=0;i<coef.length;i++){
@@ -491,15 +512,21 @@ function calcGivenX(){
     let dev = getActiveDevice();
     if(!dev) return;
     const points = dev.points;
+    currentLagOrder = parseInt(document.getElementById("lagOrderSelect").value);
 
     let yPoly = currentFitCoef ? polyEval(currentFitCoef,xv) : NaN;
-    let yFour = points.length>=5 ? lagrangeEval(points,xv) : NaN;
+    let yLag = points.length >= (currentLagOrder+1) ? lagrangeEval(points,xv,currentLagOrder) : NaN;
+
+    const xs = points.map(p=>p.x);
+    const ptMinX = Math.min(...xs);
+    const ptMaxX = Math.max(...xs);
+    const outRange = (xv < ptMinX -1e-9) || (xv > ptMaxX +1e-9);
 
     resDiv.innerHTML = `
     <div>输入 X = ${xv}</div>
     <div><b>选定${currentFitOrder}阶多项式 Y = ${isNaN(yPoly)?'--':yPoly.toFixed(6)} mm</b></div>
-    <div>四次拉格朗日插值 Y = ${isNaN(yFour)?'--':yFour.toFixed(6)} mm</div>
-    <div class="warn">⚠️插值仅在测点最小X~最大X区间内可信，禁止外推</div>
+    <div>${currentLagOrder}阶拉格朗日插值 Y = ${isNaN(yLag)?'--':yLag.toFixed(6)} mm</div>
+    ${outRange?'<div class="warn">⚠️该X在测点区间外，属于外推，插值结果不可信</div>':'<div class="info">✅X落在测点有效区间内</div>'}
     `;
 }
 
@@ -512,7 +539,7 @@ function solveY0(){
     const xMin = Math.min(...xs);
     const xMax = Math.max(...xs);
 
-    let rootPoly = findRoot(currentFitCoef, xMin, xMax, false);
+    let rootPoly = findRoot(currentFitCoef, xMin, xMax, false,0);
 
     zeroDiv.innerHTML=`
     <div>搜索区间：X ∈ [${xMin.toFixed(4)}, ${xMax.toFixed(4)}]</div>
@@ -521,17 +548,21 @@ function solveY0(){
     `;
 }
 
-//程序入口
 (function initApp(){
     loadStorage();
     activeDeviceId = deviceList[0].id;
     renderDeviceSelect();
     renderTable();
-    refreshFitOrderSelect(); //【修改】初始化动态阶数下拉
-    //阶数下拉变更事件
+    refreshFitOrderSelect();
+    refreshLagOrderSelect();
+    //多项式阶数变更事件
     document.getElementById("fitOrderSelect").onchange = ()=>{
         currentFitOrder = parseInt(document.getElementById("fitOrderSelect").value);
         try{doFit();}catch(e){console.error(e);}
+    };
+    //拉格朗日阶数变更事件
+    document.getElementById("lagOrderSelect").onchange = ()=>{
+        currentLagOrder = parseInt(document.getElementById("lagOrderSelect").value);
     };
     try{doFit();}catch(e){
         console.error(e);
