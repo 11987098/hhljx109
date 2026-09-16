@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>磨削接刀标定计算器-多设备版</title>
+<style>
+*{box-sizing:border-box;font-family:system-ui}
+body{max-width:1100px;margin:16px auto;padding:12px;background:#f4f6f8}
+.box{background:#fff;padding:16px;border-radius:8px;margin-bottom:12px;box-shadow:0 1px 3px #0002}
+h3{margin-top:0;font-size:16px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0}
+input{padding:6px 8px;width:140px;border:1px solid #bbb;border-radius:4px;font-size:14px}
+select{padding:6px 8px;border:1px solid #bbb;border-radius:4px;font-size:14px;min-width:160px}
+button{padding:6px 12px;border:none;border-radius:4px;background:#2563eb;color:#fff;cursor:pointer;font-size:14px}
+button.del{background:#dc2626}
+button.gray{background:#666}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #ccc;padding:6px;text-align:center}
+th{background:#efefef}
+.warn{color:#c00;font-weight:bold}
+</style>
+</head>
+<body>
+<div class="box">
+<h3>📊 磨削接刀标定工具【多设备管理】</h3>
+<div class="row">
+    <select id="deviceSelect">
+    </select>
+    <button onclick="createNewDevice()">新建设备</button>
+    <button class="gray" onclick="deleteCurrentDevice()">删除当前设备</button>
+    <button onclick="exportDeviceCSV()">导出本设备CSV</button>
+</div>
+<div class="row">
+    <input id="inX" placeholder="输入X，例：-0.207">
+    <input id="inY" placeholder="输入Y，例：0.003">
+    <button onclick="addPoint()">添加数据点</button>
+    <button onclick="clearAllPoints()">清空本设备测点</button>
+</div>
+<table>
+<thead><tr><th>序号</th><th>X (mm)</th><th>Y (mm)</th><th>操作</th></tr></thead>
+<tbody id="dataTable"></tbody>
+</table>
+</div>
+
+<div class="box">
+<h3>🔢 计算区</h3>
+<div class="row">
+    <input id="evalX" placeholder="输入X求Y，例 -0.186">
+    <button onclick="calcGivenX()">计算该X对应的Y</button>
+</div>
+<div id="evalResult"></div>
+<div class="row" style="margin-top:8px">
+<button onclick="solveY0()">求解 Y=0 时的X零点（有效区间根）</button>
+</div>
+<div id="zeroResult"></div>
+</div>
+
+<div class="box">
+<h3>📈 拟合结果</h3>
+<div id="fitInfo"></div>
+</div>
+
+<div class="box">
+<h3>📋 调机参考表（四次插值，步长0.002mm，区间‑0.21~‑0.17）</h3>
+<div id="refTable"></div>
+</div>
+
+<script>
+// localStorage存储key
+const STORAGE_KEY = "grind_calib_devices";
+let deviceList = [];
+let activeDeviceId = null;
+let fitLinear=null, fitQuad=null;
+
+// 读取本地存储
+function loadStorage(){
+    let raw = localStorage.getItem(STORAGE_KEY);
+    if(raw){
+        deviceList = JSON.parse(raw);
+    }else{
+        // 默认初始化一台设备
+        deviceList = [
+            {
+                id:"dev_001",
+                name:"设备#1",
+                points:[
+                    {x:0, y:-0.0077},
+                    {x:-0.72, y:0.0078},
+                    {x:-0.36, y:0.0050},
+                    {x:-0.18, y:-0.0020},
+                    {x:-0.207, y:0.0030}
+                ]
+            }
+        ];
+    }
+    saveStorage();
+}
+
+function saveStorage(){
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(deviceList));
+}
+
+// 刷新设备下拉选择框
+function renderDeviceSelect(){
+    const sel = document.getElementById("deviceSelect");
+    sel.innerHTML = "";
+    deviceList.forEach(dev=>{
+        let opt = document.createElement("option");
+        opt.value = dev.id;
+        opt.innerText = dev.name;
+        sel.appendChild(opt);
+    });
+    if(activeDeviceId){
+        sel.value = activeDeviceId;
+    }
+    sel.onchange = function(){
+        activeDeviceId = this.value;
+        renderTable();
+        try{doFit();}catch(e){console.error(e);}
+    }
+}
+
+// 获取当前激活设备对象
+function getActiveDevice(){
+    return deviceList.find(d=>d.id === activeDeviceId);
+}
+
+// 新建设备弹窗输入名字
+function createNewDevice(){
+    let devName = prompt("输入设备名称：例如：磨床A，主轴2号");
+    if(!devName || devName.trim()==="") return;
+    let newId = "dev_"+Date.now();
+    deviceList.push({
+        id:newId,
+        name:devName.trim(),
+        points:[]
+    });
+    activeDeviceId = newId;
+    saveStorage();
+    renderDeviceSelect();
+    renderTable();
+    try{doFit();}catch(e){console.error(e);}
+}
+
+// 删除当前选中设备
+function deleteCurrentDevice(){
+    let dev = getActiveDevice();
+    if(!dev) return;
+    if(!confirm(`确认删除设备【${dev.name}】，所有测点数据会丢失！`)) return;
+    deviceList = deviceList.filter(d=>d.id!==activeDeviceId);
+    if(deviceList.length===0){
+        // 至少保留一个空设备
+        deviceList.push({id:"dev_"+Date.now(),name:"新设备",points:[]});
+    }
+    activeDeviceId = deviceList[0].id;
+    saveStorage();
+    renderDeviceSelect();
+    renderTable();
+    try{doFit();}catch(e){console.error(e);}
+}
+
+// 导出当前设备CSV文本，浏览器下载
+function exportDeviceCSV(){
+    let dev = getActiveDevice();
+    if(!dev || dev.points.length===0){alert("当前设备没有测点");return;}
+    let text = "X(mm),Y(mm)\n";
+    dev.points.forEach(p=>{
+        text += `${p.x},${p.y}\n`;
+    });
+    let blob = new Blob([text],{type:"text/csv"});
+    let a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = dev.name+".csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+}
+
+function addPoint(){
+    let dev = getActiveDevice();
+    if(!dev) return;
+    let x = parseFloat(document.getElementById('inX').value.trim());
+    let y = parseFloat(document.getElementById('inY').value.trim());
+    if(isNaN(x)||isNaN(y)){alert("请输入有效的数字");return;}
+    dev.points.push({x:x,y:y});
+    document.getElementById('inX').value='';
+    document.getElementById('inY').value='';
+    saveStorage();
+    renderTable();
+    try{doFit();}catch(err){console.error(err);}
+}
+
+function delPoint(idx){
+    let dev = getActiveDevice();
+    if(!dev) return;
+    dev.points.splice(idx,1);
+    saveStorage();
+    renderTable();
+    try{doFit();}catch(err){console.error(err);}
+}
+
+function clearAllPoints(){
+    let dev = getActiveDevice();
+    if(!dev) return;
+    if(!confirm(`确认清空【${dev.name}】全部测点？`)) return;
+    dev.points = [];
+    saveStorage();
+    renderTable();
+    try{doFit();}catch(err){console.error(err);}
+}
+
+function renderTable(){
+    const tb = document.getElementById('dataTable');
+    tb.innerHTML='';
+    let dev = getActiveDevice();
+    if(!dev) return;
+    dev.points.forEach((p,i)=>{
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${i+1}</td><td>${p.x}</td><td>${p.y}</td>
+        <td><button class="del" onclick="delPoint(${i})">删除</button></td>`;
+        tb.appendChild(tr);
+    })
+}
+
+//修复版高斯消元
+function gauss(A, B){
+    let n = B.length;
+    for(let i=0;i<n;i++){
+        let maxRow=i;
+        for(let r=i;r<n;r++){
+            if(Math.abs(A[r][i])>Math.abs(A[maxRow][i])) maxRow=r;
+        }
+        [A[i],A[maxRow]] = [A[maxRow],A[i]];
+        [B[i],B[maxRow]] = [B[maxRow],B[i]];
+        let div = A[i][i];
+        if(Math.abs(div)<1e-12) return null;
+        for(let c=i;c<n;c++) A[i][c]/=div;
+        B[i]/=div;
+        for(let r=0;r<n;r++){
+            if(r!==i && Math.abs(A[r][i])>1e-12){
+                let fac=A[r][i];
+                for(let c=i;c<n;c++) A[r][c] -= fac*A[i][c];
+                B[r] -= fac*B[i];
+            }
+        }
+    }
+    return B;
+}
+
+function polyFit(pList, m){
+    const N = pList.length;
+    if(N <= m) return null;
+    let A = Array.from({length:m+1}, ()=>Array(m+1).fill(0));
+    let B = Array(m+1).fill(0);
+    for(let i=0;i<=m;i++){
+        for(let j=0;j<=m;j++){
+            let s=0;
+            for(let p of pList) s+= Math.pow(p.x,i+j);
+            A[i][j]=s;
+        }
+        let sb=0;
+        for(let p of pList) sb+= p.y*Math.pow(p.x,i);
+        B[i]=sb;
+    }
+    return gauss(A,B);
+}
+
+//拉格朗日插值求值
+function lagrangeEval(pList, x0){
+    let n=pList.length;
+    let res=0;
+    for(let i=0;i<n;i++){
+        let li=1.0;
+        for(let j=0;j<n;j++){
+            if(i===j) continue;
+            li *= (x0 - pList[j].x)/(pList[i].x - pList[j].x);
+        }
+        res += pList[i].y * li;
+    }
+    return res;
+}
+
+function polyEval(coef, x){
+    if(!coef) return NaN;
+    let y=0;
+    for(let i=0;i<coef.length;i++){
+        y += coef[i]*Math.pow(x,i);
+    }
+    return y;
+}
+
+//二分法求根
+function findRoot(coefOrPointList, xL, xR, isLagrange){
+    let fL = isLagrange ? lagrangeEval(coefOrPointList,xL) : polyEval(coefOrPointList,xL);
+    let fR = isLagrange ? lagrangeEval(coefOrPointList,xR) : polyEval(coefOrPointList,xR);
+    if((fL>0&&fR>0) || (fL<0&&fR<0)) return null;
+    for(let k=0;k<80;k++){
+        let xm=(xL+xR)/2;
+        let fm = isLagrange ? lagrangeEval(coefOrPointList,xm) : polyEval(coefOrPointList,xm);
+        if(Math.abs(fm)<1e-7) return xm;
+        let fLm = isLagrange ? lagrangeEval(coefOrPointList,xL) : polyEval(coefOrPointList,xL);
+        if((fm>0&&fLm>0)||(fm<0&&fLm<0)) xL=xm;
+        else xR=xm;
+    }
+    return (xL+xR)/2;
+}
+
+function doFit(){
+    const infoDiv = document.getElementById('fitInfo');
+    const refDiv = document.getElementById('refTable');
+    refDiv.innerHTML='';
+    let dev = getActiveDevice();
+    if(!dev){
+        infoDiv.innerHTML="<span class='warn'>请选择设备</span>";
+        fitLinear=null; fitQuad=null;
+        return;
+    }
+    const points = dev.points;
+    if(points.length<2){
+        infoDiv.innerHTML="<span class='warn'>数据点不足，至少2个点</span>";
+        fitLinear=null; fitQuad=null;
+        return;
+    }
+    fitLinear = polyFit(points,1);
+    fitQuad = polyFit(points,2);
+
+    let html='';
+    if(fitLinear){
+        html += `<div><b>线性模型：Y = ${fitLinear[0].toFixed(6)} + ${fitLinear[1].toFixed(6)} * X</b></div>`;
+    }else html+="<div>线性拟合失败</div>";
+    if(fitQuad){
+        html += `<div><b>二次模型：Y = ${fitQuad[0].toFixed(6)} + ${fitQuad[1].toFixed(6)}*X + ${fitQuad[2].toFixed(6)}*X²</b></div>`;
+    }else html+="<div>二次拟合失败</div>";
+    if(points.length>=5){
+        html += `<div>四次：拉格朗日插值（过全部测点）</div>`;
+    }
+    infoDiv.innerHTML=html;
+
+    if(points.length>=3){
+        let rHtml='<table><tr><th>X(mm)</th><th>四次插值Y(mm)</th></tr>';
+        for(let xv=-0.21; xv<=-0.17; xv+=0.002){
+            let y4 = lagrangeEval(points, xv);
+            rHtml += `<tr><td>${xv.toFixed(3)}</td><td>${y4.toFixed(6)}</td></tr>`;
+        }
+        rHtml+='</table>';
+        refDiv.innerHTML=rHtml;
+    }
+}
+
+function calcGivenX(){
+    const xv = parseFloat(document.getElementById('evalX').value.trim());
+    const resDiv = document.getElementById('evalResult');
+    if(isNaN(xv)){resDiv.innerHTML="<span class='warn'>请输入X数值</span>";return;}
+    let dev = getActiveDevice();
+    if(!dev) return;
+    const points = dev.points;
+    let yLin = fitLinear ? polyEval(fitLinear,xv) : NaN;
+    let yQuad = fitQuad ? polyEval(fitQuad,xv) : NaN;
+    let yFour = points.length>=5 ? lagrangeEval(points,xv) : NaN;
+    resDiv.innerHTML = `
+    <div>输入 X = ${xv}</div>
+    <div>线性模型 Y = ${isNaN(yLin)?'--':yLin.toFixed(6)} mm</div>
+    <div>二次模型 Y = ${isNaN(yQuad)?'--':yQuad.toFixed(6)} mm</div>
+    <div>四次插值 Y = ${isNaN(yFour)?'--':yFour.toFixed(6)} mm</div>
+    <div class="warn">⚠️四次插值仅在测点最小X~最大X区间内可信，禁止外推</div>
+    `;
+}
+
+function solveY0(){
+    const zeroDiv = document.getElementById('zeroResult');
+    let dev = getActiveDevice();
+    if(!dev || dev.points.length<3){zeroDiv.innerHTML="<span class='warn'>数据点太少</span>";return;}
+    const points = dev.points;
+    const xs = points.map(p=>p.x);
+    const xMin = Math.min(...xs);
+    const xMax = Math.max(...xs);
+
+    let rootLin = null;
+    if(fitLinear && Math.abs(fitLinear[1])>1e-12){
+        rootLin = -fitLinear[0]/fitLinear[1];
+    }
+    let rootQuad = fitQuad ? findRoot(fitQuad,xMin,xMax,false) : null;
+    let rootFour = points.length>=5 ? findRoot(points, xMin, xMax, true) : null;
+
+    zeroDiv.innerHTML=`
+    <div>搜索区间：X ∈ [${xMin.toFixed(4)}, ${xMax.toFixed(4)}]</div>
+    <div>线性模型 Y=0 → X0 = ${rootLin!==null?rootLin.toFixed(6):"无"} mm</div>
+    <div>二次模型 Y=0 → X0 = ${rootQuad!==null?rootQuad.toFixed(6):"无"} mm</div>
+    <div><b>四次插值 Y=0 → X0 = ${rootFour!==null?rootFour.toFixed(6):"区间内无零点"} mm</b></div>
+    <div class="warn">⚠️零点仅为数学计算值，现场仍需小步进微调验证</div>
+    `;
+}
+
+//程序入口
+(function initApp(){
+    loadStorage();
+    activeDeviceId = deviceList[0].id;
+    renderDeviceSelect();
+    renderTable();
+    try{doFit();}catch(e){
+        console.error(e);
+        document.getElementById("fitInfo").innerHTML="<span class='warn'>拟合运算异常："+e.message+"</span>";
+    }
+})();
+</script>
+</body>
+</html>
