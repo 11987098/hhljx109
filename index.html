@@ -467,9 +467,9 @@ function buildRefTable(){
         let yVal = lagrangeEval(points, xv, currentLagOrder);
         let outOfRange = (xv < ptMinX - 1e-9) || (xv > ptMaxX + 1e-9);
         if(outOfRange){
-            rHtml += `<tr><td>${xv.toFixed(3)}</td><td style="color:#c00">外推不可信</td></tr>`;
+            rHtml += `<tr><td>${xv.toFixed(6)}</td><td style="color:#c00">外推不可信</td></tr>`;
         }else{
-            rHtml += `<tr><td>${xv.toFixed(3)}</td><td>${yVal.toFixed(6)}</td></tr>`;
+            rHtml += `<tr><td>${xv.toFixed(6)}</td><td>${yVal.toFixed(6)}</td></tr>`;
         }
     }
     rHtml+='</table>';
